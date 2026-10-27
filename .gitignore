@@ -1,0 +1,11 @@
+# never commit images or model weights
+*.png
+*.jpg
+*.dcm
+*.pt
+*.pth
+mlruns/
+.venv/
+__pycache__/
+.pytest_cache/
+.ipynb_checkpoints/
