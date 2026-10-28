@@ -1,11 +1,17 @@
-# never commit images or model weights
+# never commit X-ray images or model weights
 *.png
 *.jpg
 *.dcm
 *.pt
 *.pth
+models/
+outputs/
 mlruns/
 .venv/
 __pycache__/
 .pytest_cache/
 .ipynb_checkpoints/
+.DS_Store
+
+# but DO commit the plots in reports/ (used in the README)
+!reports/**/*.png

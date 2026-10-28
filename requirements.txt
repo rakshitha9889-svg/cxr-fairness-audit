@@ -1,6 +1,9 @@
 pandas>=2.2
 scikit-learn>=1.5
 pytest>=8.0
+# Step 4: fairness audit (laptop)
+fairlearn>=0.11
+matplotlib>=3.8
 # Step 3: training (already installed on Kaggle)
 torch>=2.2
 torchvision>=0.17
