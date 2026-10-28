@@ -1,4 +1,7 @@
-# Step 1-2 (data prep + tests). Training libraries are added in Step 3.
 pandas>=2.2
 scikit-learn>=1.5
 pytest>=8.0
+# Step 3: training (already installed on Kaggle)
+torch>=2.2
+torchvision>=0.17
+pillow>=10.0
