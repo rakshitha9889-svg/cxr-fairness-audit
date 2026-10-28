@@ -12,7 +12,8 @@ For each finding and each group (sex, age bin, view) it reports:
 Outputs:
   thresholds.csv        threshold per finding (from validation)
   subgroup_metrics.csv  one row per finding x group, with CIs
-  gaps.csv              max-min gap per finding and attribute, with CIs
+  gaps.csv              best-minus-worst group difference per finding and attribute, with CIs
+                        (signed difference for a fixed pair, so the CI can include 0)
   auroc_by_sex.png, tpr_gap.png
 """
 import argparse
@@ -115,59 +116,69 @@ def main():
                 rows.append({"finding": f, "attribute": a, "group": grp, **r.to_dict()})
     point = pd.DataFrame(rows)
 
-    def gaps_of(table):
-        res = []
-        for (f, a), t in table.groupby(["finding", "attribute"]):
-            res.append({"finding": f, "attribute": a,
-                        "auroc_gap": t["auroc"].max() - t["auroc"].min(),
-                        "tpr_gap": t["tpr"].max() - t["tpr"].min(),
-                        "fpr_gap": t["fpr"].max() - t["fpr"].min()})
-        return pd.DataFrame(res)
-
-    point_gaps = gaps_of(point)
-
     # 3. Patient-level bootstrap for confidence intervals.
     print(f"Bootstrapping {args.n_boot} resamples (a few minutes on a laptop)...")
-    boot_rows, boot_gaps = [], []
+    boot_rows = []
     for b, sample in enumerate(patient_bootstrap(test, args.n_boot, args.seed)):
-        rs = []
         for f in FINDINGS:
             for a in ATTRIBUTES:
                 for grp, r in fast_group_metrics(sample, f, a, thr[f]).items():
-                    rs.append({"finding": f, "attribute": a, "group": grp, "b": b, **r})
-        rs = pd.DataFrame(rs)
-        boot_rows.append(rs)
-        bg = gaps_of(rs)
-        bg["b"] = b
-        boot_gaps.append(bg)
-    boot = pd.concat(boot_rows)
-    bgap = pd.concat(boot_gaps)
+                    boot_rows.append({"finding": f, "attribute": a, "group": grp, "b": b, **r})
+    boot = pd.DataFrame(boot_rows)
 
-    def add_ci(point_df, boot_df, keys, cols):
-        lo = boot_df.groupby(keys)[cols].quantile(0.025).add_suffix("_lo")
-        hi = boot_df.groupby(keys)[cols].quantile(0.975).add_suffix("_hi")
-        return point_df.set_index(keys).join(lo).join(hi).reset_index()
-
-    sub = add_ci(point, boot, ["finding", "attribute", "group"], ["auroc", "tpr", "fpr"])
-    gaps = add_ci(point_gaps, bgap, ["finding", "attribute"], ["auroc_gap", "tpr_gap", "fpr_gap"])
+    lo = boot.groupby(["finding", "attribute", "group"])[["auroc", "tpr", "fpr"]].quantile(0.025).add_suffix("_lo")
+    hi = boot.groupby(["finding", "attribute", "group"])[["auroc", "tpr", "fpr"]].quantile(0.975).add_suffix("_hi")
+    sub = point.set_index(["finding", "attribute", "group"]).join(lo).join(hi).reset_index()
     sub.round(4).to_csv(out / "subgroup_metrics.csv", index=False)
+
+    # Gap = SIGNED difference between the best and the worst group (pair fixed on the full test set).
+    # Its bootstrap CI can cross 0; if it does, the gap may be noise.
+    gap_rows = []
+    for (f, a), t in point.groupby(["finding", "attribute"]):
+        row = {"finding": f, "attribute": a}
+        for m in ["tpr", "auroc", "fpr"]:
+            tt = t.dropna(subset=[m])
+            if len(tt) < 2:
+                row.update({f"{m}_gap": np.nan, f"{m}_high_group": "", f"{m}_low_group": "",
+                            f"{m}_gap_lo": np.nan, f"{m}_gap_hi": np.nan})
+                continue
+            g_hi = tt.loc[tt[m].idxmax(), "group"]
+            g_lo = tt.loc[tt[m].idxmin(), "group"]
+            bb = boot[(boot["finding"] == f) & (boot["attribute"] == a)].pivot(index="b", columns="group", values=m)
+            diff = (bb[g_hi] - bb[g_lo]).dropna()
+            row.update({f"{m}_gap": tt[m].max() - tt[m].min(), f"{m}_high_group": g_hi, f"{m}_low_group": g_lo,
+                        f"{m}_gap_lo": diff.quantile(0.025), f"{m}_gap_hi": diff.quantile(0.975)})
+        gap_rows.append(row)
+    gaps = pd.DataFrame(gap_rows)
+    gaps["tpr_gap_significant"] = gaps["tpr_gap_lo"] > 0
+    gaps["auroc_gap_significant"] = gaps["auroc_gap_lo"] > 0
     gaps.round(4).to_csv(out / "gaps.csv", index=False)
 
     # 4. Readable summary.
     print("\nThresholds (validation, ~{:.0%} sensitivity):".format(args.target_sensitivity))
     for f, t in thr.items():
         print(f"  {f:13s} {t:.3f}")
-    print("\nTPR (sensitivity) by sex, with 95% CI:")
-    s = sub[sub["attribute"] == "sex"]
-    for _, r in s.iterrows():
-        print(f"  {r['finding']:13s} {r['group']}: TPR {r['tpr']:.3f} [{r['tpr_lo']:.3f}, {r['tpr_hi']:.3f}]"
-              f"  AUROC {r['auroc']:.3f}  positives {int(r['n_pos'])}")
-    print("\nLargest gaps (TPR, with 95% CI):")
+    names = {"sex": "sex", "age_bin": "age", "view": "view"}
+    for a in ATTRIBUTES:
+        print(f"\nBy {names[a]} (TPR = sensitivity, FPR = false alarms; 95% CI):")
+        t = sub[sub["attribute"] == a]
+        for _, r in t.iterrows():
+            tpr = "   n/a (too few positives)" if np.isnan(r["tpr"]) else \
+                f"{r['tpr']:.3f} [{r['tpr_lo']:.3f}, {r['tpr_hi']:.3f}]"
+            print(f"  {r['finding']:13s} {str(r['group']):6s} TPR {tpr}  FPR {r['fpr']:.3f}  "
+                  f"AUROC {r['auroc']:.3f}  positives {int(r['n_pos'])}/{int(r['n'])}")
+    print("\nTPR gaps, best minus worst group (95% CI). REAL = CI does not include 0:")
     for _, r in gaps.sort_values("tpr_gap", ascending=False).iterrows():
-        print(f"  {r['finding']:13s} {r['attribute']:8s} TPR gap {r['tpr_gap']:.3f} "
-              f"[{r['tpr_gap_lo']:.3f}, {r['tpr_gap_hi']:.3f}]   AUROC gap {r['auroc_gap']:.3f}")
+        if np.isnan(r["tpr_gap"]):
+            print(f"  {r['finding']:13s} {r['attribute']:8s} not enough positives in 2+ groups")
+            continue
+        flag = "REAL" if r["tpr_gap_significant"] else "could be noise"
+        print(f"  {r['finding']:13s} {r['attribute']:8s} {str(r['tpr_high_group']):>5s} > {str(r['tpr_low_group']):5s} "
+              f"by {r['tpr_gap']:.3f} [{r['tpr_gap_lo']:+.3f}, {r['tpr_gap_hi']:+.3f}]  {flag}   "
+              f"(AUROC gap {r['auroc_gap']:.3f} [{r['auroc_gap_lo']:+.3f}, {r['auroc_gap_hi']:+.3f}])")
 
     # 5. Plots for the README.
+    s = sub[sub["attribute"] == "sex"]
     fig, ax = plt.subplots(figsize=(8, 4))
     width = 0.38
     x = np.arange(len(FINDINGS))
@@ -190,7 +201,8 @@ def main():
         err = [t["tpr_gap"] - t["tpr_gap_lo"], t["tpr_gap_hi"] - t["tpr_gap"]]
         ax.bar(x + (i - 1) * 0.27, t["tpr_gap"], 0.27, yerr=err, capsize=3, label=a)
     ax.set_xticks(x, FINDINGS)
-    ax.set_ylabel("Max - min TPR across groups")
+    ax.axhline(0, color="grey", lw=0.8)
+    ax.set_ylabel("TPR: best minus worst group")
     ax.set_title("Sensitivity gap at the validation threshold (95% CI)")
     ax.legend()
     fig.tight_layout()
